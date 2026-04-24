@@ -129,7 +129,10 @@ export const LiveVoiceChat: React.FC<LiveVoiceChatProps> = ({ scenario }) => {
       currentEmotionRef.current = 'red';
 
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      
+      if (audioContextRef.current.state === 'suspended') {
+        try { await audioContextRef.current.resume(); } catch (e) {}
+      }
+
       const systemInstruction = `
 You are participating in a clinical advocacy simulation for Sickle Cell Disease (SCD).
 You will roleplay as the colleague or patient described in the scenario.
@@ -152,10 +155,11 @@ If they are passive or aggressive, you might remain dismissive or defensive.
 Keep your responses relatively brief, conversational, and realistic.
 
 CRITICAL INSTRUCTIONS:
-1. START THE CONVERSATION: You must speak first. Deliver a 1-2 sentence opening statement in character that sets up the conflict (e.g., "I don't think he needs this medication, he might be drug seeking.").
-2. TAKE TURNS: You MUST wait for the user to speak before responding. DO NOT simulate both sides of the conversation. Speak exactly once, then stop and wait for the user's audio response.
-3. UPDATE EMOTION: You MUST call the \`updateEmotion\` tool frequently to reflect the current tension level. Start with 'red' (tense), move to 'yellow' as they make good points, and 'green' when the issue is resolved or de-escalated.
-4. END SIMULATION: End the simulation ONLY when the tension level reaches 'green' (the issue is successfully resolved) OR if the conversation becomes hopelessly deadlocked/escalated after several turns. Call the \`endSimulation\` function to terminate the session and provide their evaluation report. Do not say goodbye, just call the function.
+1. START THE CONVERSATION: You must speak first. As soon as the session begins, deliver a 1-2 sentence opening statement in character that sets up the conflict (e.g., "I don't think he needs this medication, he might be drug seeking."). Do NOT wait for the user to speak first.
+2. TAKE TURNS: After your opening, wait for the user to respond. Speak once per turn, then stop and wait.
+3. UPDATE EMOTION: Call the \`updateEmotion\` tool at the start and whenever the tension level meaningfully shifts. Start with 'red', move to 'yellow' as the user makes good points, and 'green' when resolved.
+4. END SIMULATION — BE PATIENT: Do NOT call \`endSimulation\` early. Only call it after AT LEAST 4 substantive user turns AND one of: (a) tension has reached 'green' and held for a turn, or (b) the conversation is hopelessly deadlocked after 6+ turns. Never end on the first or second user turn.
+5. IF YOU HEAR SILENCE OR UNCLEAR AUDIO: Simply stay in character and wait. Do not end the simulation.
 `;
 
       // Re-initialize the AI client to pick up the latest API key if it was just selected
@@ -164,22 +168,23 @@ CRITICAL INSTRUCTIONS:
       const sessionPromise = currentAi.live.connect({
         model: "gemini-3.1-flash-live-preview",
         callbacks: {
-          onopen: () => {
+          onopen: async () => {
             setIsConnected(true);
             setIsConnecting(false);
+
+            // Send the initial cue FIRST so the AI starts its opening before the mic can feed it silence.
+            try {
+              const session = await sessionPromise;
+              session.sendClientContent({
+                turns: [{ role: "user", parts: [{ text: "Begin the simulation now. Deliver your opening statement in character." }] }],
+                turnComplete: true
+              });
+            } catch (e) {
+              console.error("Error sending initial cue:", e);
+            }
+
+            // Only then start capturing the user's mic.
             startRecording(sessionPromise);
-            
-            // Send initial cue to prompt the AI to start
-            sessionPromise.then((session: any) => {
-              try {
-                session.sendClientContent({
-                  turns: [{ role: "user", parts: [{ text: "Please begin the simulation now by delivering your opening statement." }] }],
-                  turnComplete: true
-                });
-              } catch (e) {
-                console.error("Error sending initial cue:", e);
-              }
-            });
           },
           onmessage: async (message: any) => {
             // Check for tool calls
@@ -198,7 +203,7 @@ CRITICAL INSTRUCTIONS:
                   if (oldEmotion === 'red' || oldEmotion === 'yellow' || oldEmotion === 'green') {
                      timeInEmotionRef.current[oldEmotion as keyof typeof timeInEmotionRef.current] += timeSpent;
                   }
-                  
+
                   setMetrics({
                     durationSeconds: Math.floor((now - startTimeRef.current) / 1000),
                     timeInRed: Math.floor(timeInEmotionRef.current.red / 1000),
@@ -208,6 +213,13 @@ CRITICAL INSTRUCTIONS:
                     turns: turnCountRef.current
                   });
                   setReport(args as EvaluationReport);
+                  // Respond to the tool call before closing so the server records a clean termination
+                  try {
+                    const session = await sessionPromise;
+                    session.sendToolResponse({
+                      functionResponses: [{ id: call.id, name: call.name, response: { result: "acknowledged" } }]
+                    });
+                  } catch (e) {}
                   stopSession();
                   return;
                 } else if (call.name === 'updateEmotion') {
@@ -246,28 +258,57 @@ CRITICAL INSTRUCTIONS:
               }
             }
 
-            // Handle audio output
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
-            if (base64Audio) {
-              playAudioChunk(base64Audio);
+            // Handle ALL audio output chunks (not just parts[0])
+            const parts = message.serverContent?.modelTurn?.parts ?? [];
+            for (const part of parts) {
+              const b64 = part?.inlineData?.data;
+              if (b64) playAudioChunk(b64);
             }
-            
-            // Handle interruption
+
+            // Handle interruption (user started speaking mid-AI-response)
             if (message.serverContent?.interrupted) {
               playbackQueueRef.current = [];
               nextPlayTimeRef.current = audioContextRef.current?.currentTime || 0;
               setIsAiSpeaking(false);
             }
 
-            // Handle transcription
-            if (message.serverContent?.modelTurn) {
-               const textParts = message.serverContent.modelTurn.parts.filter((p: any) => p.text).map((p: any) => p.text).join('');
-               if (textParts) {
-                 setTranscript(prev => [...prev, { role: 'ai', text: textParts }]);
-               }
+            // Turn complete — AI finished speaking
+            if (message.serverContent?.turnComplete) {
+              setIsAiSpeaking(false);
+            }
+
+            // AI transcription (only delivered when outputAudioTranscription is enabled).
+            // Concat streaming chunks while the speaker doesn't change.
+            const aiText = message.serverContent?.outputTranscription?.text;
+            if (aiText) {
+              setTranscript(prev => {
+                const last = prev[prev.length - 1];
+                if (last && last.role === 'ai') {
+                  return [...prev.slice(0, -1), { role: 'ai', text: last.text + aiText }];
+                }
+                return [...prev, { role: 'ai', text: aiText }];
+              });
+            }
+
+            // User transcription (only delivered when inputAudioTranscription is enabled).
+            const userText = message.serverContent?.inputTranscription?.text;
+            if (userText) {
+              setTranscript(prev => {
+                const last = prev[prev.length - 1];
+                if (last && last.role === 'user') {
+                  return [...prev.slice(0, -1), { role: 'user', text: last.text + userText }];
+                }
+                return [...prev, { role: 'user', text: userText }];
+              });
             }
           },
-          onclose: () => {
+          onclose: (event?: any) => {
+            console.log("Live session closed.", { code: event?.code, reason: event?.reason });
+            // Only surface a message if the user didn't stop it themselves and no report was generated
+            if (isActiveRef.current) {
+              const reason = event?.reason || 'The server closed the connection unexpectedly.';
+              setError(`Session ended: ${reason}`);
+            }
             stopSession();
           },
           onerror: (err: any) => {
@@ -286,6 +327,8 @@ CRITICAL INSTRUCTIONS:
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } },
           },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
           systemInstruction: { parts: [{ text: systemInstruction }] },
           tools: [{ functionDeclarations: [endSimulationDeclaration, updateEmotionDeclaration] }],
           toolConfig: { functionCallingConfig: {} }
@@ -510,16 +553,54 @@ CRITICAL INSTRUCTIONS:
           </div>
         )}
 
-        {/* Info panel - centered horizontally and vertically when its the only thing */}
+        {/* Scenario briefing — shown before the session starts so the user knows what they're walking into */}
         {!isConnected && !isConnecting && !report && (
-          <div className="text-center text-slate-600 max-w-md p-8 md:p-12 shrink-0 m-auto bg-white/70 backdrop-blur-md border border-white/80 rounded-[2rem] shadow-xl shadow-slate-200/50">
-            <div className="w-20 h-20 bg-gradient-to-br from-indigo-100 to-indigo-50 rounded-[1.5rem] flex items-center justify-center mx-auto mb-6 shadow-inner rotate-3">
-               <Mic className="h-10 w-10 text-indigo-500 -rotate-3" />
+          <div className="max-w-2xl w-full m-auto bg-white/70 backdrop-blur-md border border-white/80 rounded-[2rem] shadow-xl shadow-slate-200/50 overflow-hidden shrink-0">
+            <div className="px-6 md:px-8 pt-6 md:pt-8 pb-5 bg-gradient-to-br from-indigo-50/60 to-white/30 border-b border-white/60">
+              <div className="flex items-start gap-4">
+                <div className="w-14 h-14 bg-gradient-to-br from-indigo-100 to-indigo-50 rounded-[1.2rem] flex items-center justify-center shadow-inner rotate-3 shrink-0">
+                  <Mic className="h-7 w-7 text-indigo-500 -rotate-3" />
+                </div>
+                <div className="min-w-0">
+                  <p className="text-[10px] md:text-xs font-bold uppercase tracking-widest text-indigo-600 mb-1">Voice Simulation Briefing</p>
+                  <h3 className="text-slate-900 font-extrabold text-lg md:text-2xl tracking-tight leading-snug">{scenario.title}</h3>
+                </div>
+              </div>
             </div>
-            <p className="mb-3 text-slate-800 font-extrabold text-xl md:text-2xl tracking-tight">Practice your advocacy skills out loud.</p>
-            <p className="text-sm md:text-base text-slate-600 mb-6 font-medium">Click "Start Voice Chat" to begin a real-time conversation.</p>
-            <div className="bg-gradient-to-br from-indigo-50/80 to-blue-50/80 backdrop-blur-sm p-4 rounded-2xl border border-indigo-100 shadow-[inset_0_2px_4px_rgba(0,0,0,0.02)]">
-               <p className="text-xs md:text-sm text-indigo-900 font-semibold leading-relaxed">The simulation automatically ends when you verbally de-escalate the tension (green level) or if it takes too many turns.</p>
+
+            <div className="p-6 md:p-8 space-y-5 text-left">
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2">Clinical context</p>
+                <p className="text-sm md:text-[15px] text-slate-800 leading-relaxed font-medium">{scenario.clinicalContext}</p>
+              </div>
+
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2">The situation</p>
+                <p className="text-sm md:text-[15px] text-slate-800 leading-relaxed font-medium">{scenario.description}</p>
+              </div>
+
+              <div className="bg-gradient-to-br from-rose-50/80 to-amber-50/60 border border-rose-100 rounded-2xl p-4">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-rose-700 mb-1.5">Bias challenge to overcome</p>
+                <p className="text-sm text-rose-950 leading-relaxed font-semibold">{scenario.biasChallenge}</p>
+              </div>
+
+              <div>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500 mb-2">Your goals</p>
+                <ul className="space-y-1.5">
+                  {scenario.goals.map((goal, i) => (
+                    <li key={i} className="flex items-start gap-2 text-sm md:text-[15px] text-slate-800 font-medium leading-relaxed">
+                      <span className="inline-block w-1.5 h-1.5 rounded-full bg-indigo-500 mt-2 shrink-0" />
+                      <span>{goal}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+
+              <div className="bg-indigo-50/60 border border-indigo-100 rounded-xl p-3">
+                <p className="text-xs md:text-sm text-indigo-900 font-semibold leading-relaxed">
+                  When you hit Start, the character will speak first. Respond out loud — the simulation tracks tension on the red/yellow/green orb and ends when you de-escalate or hit a turn limit.
+                </p>
+              </div>
             </div>
           </div>
         )}
@@ -568,12 +649,35 @@ CRITICAL INSTRUCTIONS:
                 The AI is listening and will respond as the person in the scenario. Use persuasive, evidence-based language to de-escalate the tension.
               </p>
               <div className="w-full h-px bg-gradient-to-r from-transparent via-slate-200 to-transparent my-2" />
-               <button 
+               <button
                  onClick={stopSession}
                  className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 px-5 py-2.5 rounded-xl font-bold transition-colors text-sm"
                >
                  <Square className="h-4 w-4 fill-current" /> End Early
                </button>
+            </div>
+          </div>
+        )}
+
+        {/* Live transcript shown during the call so the user sees what both sides said */}
+        {isConnected && transcript.length > 0 && (
+          <div className="w-full max-w-3xl m-auto mt-6 mb-2 bg-white/60 backdrop-blur-md border border-white/70 rounded-[2rem] shadow-lg shadow-slate-200/40 overflow-hidden">
+            <div className="px-5 py-3 border-b border-white/60 bg-white/40 flex items-center gap-2">
+              <MessageSquare className="h-4 w-4 text-indigo-500" />
+              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-600">Live transcript</p>
+            </div>
+            <div className="max-h-64 overflow-y-auto px-5 py-4 space-y-3 scrollbar-hide">
+              {transcript.map((m, i) => (
+                <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[80%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed ${
+                    m.role === 'user'
+                      ? 'bg-indigo-500 text-white rounded-br-md font-medium shadow-sm'
+                      : 'bg-white/80 text-slate-800 rounded-bl-md font-medium border border-white shadow-sm'
+                  }`}>
+                    {m.text}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
         )}

@@ -3,8 +3,6 @@ import { GoogleGenAI, LiveServerMessage, Modality, Type, FunctionDeclaration } f
 import { Mic, MicOff, Loader2, Volume2, Square, CheckCircle, AlertCircle, RefreshCw, Lightbulb, MessageSquare } from 'lucide-react';
 import { Scenario } from '../types';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-
 interface LiveVoiceChatProps {
   scenario: Scenario;
 }
@@ -89,7 +87,9 @@ export const LiveVoiceChat: React.FC<LiveVoiceChatProps> = ({ scenario }) => {
   const [metrics, setMetrics] = useState<SimulationMetrics | null>(null);
 
   const sessionRef = useRef<any>(null);
+  const isActiveRef = useRef(false);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const recordingContextRef = useRef<AudioContext | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const processorRef = useRef<ScriptProcessorNode | null>(null);
   const playbackQueueRef = useRef<Float32Array[]>([]);
@@ -111,6 +111,7 @@ export const LiveVoiceChat: React.FC<LiveVoiceChatProps> = ({ scenario }) => {
         await (window as any).aistudio.openSelectKey();
       }
 
+      isActiveRef.current = true;
       setIsConnecting(true);
       setError(null);
       setReport(null);
@@ -269,9 +270,14 @@ CRITICAL INSTRUCTIONS:
           onclose: () => {
             stopSession();
           },
-          onerror: (err) => {
+          onerror: (err: any) => {
             console.error("Live API Error:", err);
-            setError("Connection error occurred. If you are in the published version, please ensure your API key is valid.");
+            const msg = err?.message || String(err) || '';
+            const isAuth = msg.toLowerCase().includes('api key') || msg.includes('401') || msg.includes('403');
+            setError(isAuth
+              ? "Authentication failed. Check that your GEMINI_API_KEY is set in Netlify and trigger a new deploy."
+              : `Connection error: ${msg || 'WebSocket closed unexpectedly.'}`
+            );
             stopSession();
           }
         },
@@ -305,21 +311,19 @@ CRITICAL INSTRUCTIONS:
       } });
       mediaStreamRef.current = stream;
 
-      // We need a separate AudioContext for recording at 16000Hz
       const recordingContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+      recordingContextRef.current = recordingContext;
       const source = recordingContext.createMediaStreamSource(stream);
       const processor = recordingContext.createScriptProcessor(4096, 1, 1);
-      
+
       processor.onaudioprocess = (e) => {
+        if (!isActiveRef.current) return;
         const inputData = e.inputBuffer.getChannelData(0);
-        // Convert Float32 to Int16
         const pcm16 = new Int16Array(inputData.length);
         for (let i = 0; i < inputData.length; i++) {
-          let s = Math.max(-1, Math.min(1, inputData[i]));
+          const s = Math.max(-1, Math.min(1, inputData[i]));
           pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
         }
-        
-        // Convert to base64
         const buffer = new Uint8Array(pcm16.buffer);
         let binary = '';
         for (let i = 0; i < buffer.byteLength; i++) {
@@ -328,6 +332,7 @@ CRITICAL INSTRUCTIONS:
         const base64Data = btoa(binary);
 
         sessionPromise.then((session: any) => {
+          if (!isActiveRef.current) return;
           try {
             session.sendRealtimeInput({
               audio: { data: base64Data, mimeType: 'audio/pcm;rate=16000' }
@@ -393,6 +398,7 @@ CRITICAL INSTRUCTIONS:
   };
 
   const stopSession = () => {
+    isActiveRef.current = false;
     if (sessionRef.current) {
       sessionRef.current.then((session: any) => {
         if (typeof session.close === 'function') {
@@ -401,13 +407,18 @@ CRITICAL INSTRUCTIONS:
       });
       sessionRef.current = null;
     }
+    if (processorRef.current) {
+      processorRef.current.onaudioprocess = null;
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach(track => track.stop());
       mediaStreamRef.current = null;
     }
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
+    if (recordingContextRef.current) {
+      try { recordingContextRef.current.close(); } catch (e) {}
+      recordingContextRef.current = null;
     }
     if (audioContextRef.current) {
       try { audioContextRef.current.close(); } catch (e) {}

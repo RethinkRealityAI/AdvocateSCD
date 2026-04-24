@@ -14,6 +14,14 @@ export default defineConfig(({ mode }) => {
         alias: {
           '@': path.resolve(__dirname, '.'),
         }
-      }
+      },
+      // Inject the Gemini API key into the client bundle at build time.
+      // Without this, `process.env.GEMINI_API_KEY` references stay literal in
+      // the output and throw `ReferenceError: process is not defined` in the
+      // browser the moment a module reading them loads — blanking the page.
+      // GEMINI_API_KEY must be set in Netlify → Site configuration → Environment variables.
+      define: {
+        'process.env.GEMINI_API_KEY': JSON.stringify(process.env.GEMINI_API_KEY ?? ''),
+      },
     };
 });

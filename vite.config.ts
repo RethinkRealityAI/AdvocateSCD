@@ -14,6 +14,11 @@ export default defineConfig(({ mode }) => {
         alias: {
           '@': path.resolve(__dirname, '.'),
         }
-      }
+      },
+      // Inject Node env vars into the client bundle at build time.
+      // GEMINI_API_KEY must be set in Netlify → Site configuration → Environment variables.
+      define: {
+        'process.env.GEMINI_API_KEY': JSON.stringify(process.env.GEMINI_API_KEY ?? ''),
+      },
     };
 });
